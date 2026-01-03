@@ -1,19 +1,34 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const KrakenClient = require('kraken-api');
+const ccxt = require('ccxt');
 
 const app = express();
-app.use(bodyParser.text({ type: '*/*' })); // Handles plain text from TradingView
+app.use(bodyParser.text({ type: '*/*' }));
 
-const PORT = process.env.PORT || 3000; // Important for hosting
+const PORT = process.env.PORT || 3000;
 
-// REPLACE THESE WITH YOUR REAL KRAKEN API KEYS (create on Kraken → Settings → API → Generate new key with trading permissions)
-const key = 's7jGaGXgFLmd0PBGjwQcRiK8fv9Fz8F7AxCTNzHqFhObks8TmyNZvCTG';
-const secret = 'zYnkU0xg5BJl9xb0JdesNejc9v5VzgpIWQZic0hjUs/uCDglWkgMFFQD2n1Ev4htHKQdZUN8gPtDVUvFzkjztQ==';
-const kraken = new KrakenClient(key, secret);
+// === CONFIGURATION ===
+const IS_DEMO = true;
 
-// Trading pair, e.g., 'XXBTZUSD' for BTC/USD or 'XETHZUSD' for ETH/USD
-const PAIR = 'XSOLZUSD';
+const API_KEY = '7l/19mgahFtopiis6jcf4Mr/TjBAVWM4hTng+Vjv62wb8Yrjy6TiDJ7v';
+const API_SECRET = 'yCJ1NuOhKO0eocIyBo8yAp2VV+EdbmTpjuQ4gBcLkbMBXeVY5l3IXyQUScnq02rZcBF+PWGkQt7yAqs4EXPIoFzW';
+
+const SYMBOL = 'PF_SOLUSD'; // Current Kraken SOL perpetual
+
+const MAX_LEVERAGE = 10;
+
+// Setup CCXT exchange
+let exchange = new ccxt.krakenfutures({
+  apiKey: API_KEY,
+  secret: API_SECRET,
+  enableRateLimit: true,
+});
+
+if (IS_DEMO) {
+  exchange.setSandboxMode(true); // Uses demo URLs automatically
+}
+
+// =====================
 
 app.post('/webhook', async (req, res) => {
   const message = req.body.trim();
@@ -23,7 +38,6 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send('Empty message');
   }
 
-  // Parse Autoview-like syntax: b=buy/sell q=XX% t=market/limit p=price sl=XX% tp=XX%
   const params = {};
   message.split(' ').forEach(part => {
     const [k, v] = part.split('=');
@@ -32,67 +46,72 @@ app.post('/webhook', async (req, res) => {
 
   try {
     if (params.c === 'position') {
-      // Close entire position (market)
-      const closed = await closePosition(params.b); // b indicates direction for opposing close
-      res.send(closed ? 'Position closed' : 'No position or error');
-      return;
+      const closed = await closePosition(params.b === 'buy' ? 'sell' : 'buy');
+      return res.send(closed ? 'Position closed' : 'No open position');
     }
 
-    // Entry order
     const side = params.b === 'buy' ? 'buy' : 'sell';
-    const type = params.t || 'market';
-    const qtyPct = parseFloat(params.q) / 100;
+    const orderType = params.t === 'limit' ? 'limit' : 'market';
+    let qtyPct = parseFloat(params.q) / 100;
 
-    // Get USD balance for sizing (adjust for short if needed)
-    const balance = await kraken.api('Balance');
-    const usdBalance = parseFloat(balance.result.ZUSD || 0);
+    // Get available USD balance
+    const balance = await exchange.fetchBalance();
+    const marginBalanceUSD = balance.free.USD || balance.free.PUSD || 0; // USD or collateral
 
-    let volume = (usdBalance * qtyPct) / (await getCurrentPrice()); // Approx volume in base currency
+    if (marginBalanceUSD <= 0) throw new Error('No available margin balance');
 
-    const orderParams = {
-      pair: PAIR,
-      type: side,
-      ordertype: type === 'limit' ? 'limit' : 'market',
-      volume: volume.toFixed(8),
-    };
+    // Get mark price
+    const ticker = await exchange.fetchTicker(SYMBOL);
+    const currentPrice = ticker.mark || ticker.last;
 
-    if (type === 'limit' && params.p) {
+    // Get current position
+    const positions = await exchange.fetchPositions([SYMBOL]);
+    const solPos = positions[0] || { contracts: 0 };
+    const currentSize = Math.abs(solPos.contracts || 0);
+    const currentNotional = currentSize * currentPrice;
+
+    qtyPct = Math.min(qtyPct, MAX_LEVERAGE);
+
+    let proposedAdditionalNotional = qtyPct * marginBalanceUSD;
+
+    const maxNotional = MAX_LEVERAGE * marginBalanceUSD;
+    const maxAdditionalNotional = maxNotional - currentNotional;
+
+    if (maxAdditionalNotional <= 0) throw new Error('Leverage cap exceeded');
+
+    proposedAdditionalNotional = Math.min(proposedAdditionalNotional, maxAdditionalNotional);
+
+    let contracts = Math.floor(proposedAdditionalNotional / currentPrice);
+
+    if (contracts < 1) throw new Error('Volume too small (min 1 contract)');
+
+    // Place order
+    const orderParams = {};
+    if (orderType === 'limit' && params.p) {
       orderParams.price = parseFloat(params.p);
     }
 
-    // Place main entry order
-    const order = await kraken.api('AddOrder', orderParams);
-    console.log('Entry order:', order);
+    const order = await exchange.createOrder(SYMBOL, orderType, side, contracts, null, orderParams);
 
-    // For SL/TP as percentages – Kraken doesn't have direct % attached, but we can calculate and place separate stop-loss orders
-    if (params.sl || params.tp) {
-      // Example: place a stop-loss-limit order after entry fills (simplified – in production monitor fill)
-      // This is basic; for full automation you'd poll OpenOrders or use conditional orders
-    }
+    console.log('Order result:', order);
 
-    res.send('Order placed');
+    res.send(`Order placed: ${side} ${contracts} contracts @ ${orderType === 'limit' ? params.p : 'market'}`);
   } catch (err) {
-    console.error('Error:', err);
-    res.status(500).send('Error placing order');
+    console.error('Error:', err.message || err);
+    res.status(500).send('Error: ' + (err.message || err));
   }
 });
 
-async function getCurrentPrice() {
-  const ticker = await kraken.api('Ticker', { pair: PAIR });
-  return parseFloat(ticker.result[PAIR].c[0]);
-}
+async function closePosition(side) {
+  const positions = await exchange.fetchPositions([SYMBOL]);
+  const solPos = positions[0];
+  if (!solPos || Math.abs(solPos.contracts || 0) === 0) return false;
 
-async function closePosition(directionFromAlert) {
-  // Simple full close – get open positions and close
-  const trades = await kraken.api('OpenPositions');
-  if (Object.keys(trades.result).length === 0) return false;
+  const closeSize = Math.abs(solPos.contracts);
 
-  // For spot, use market sell/buy to close – adjust logic as needed
-  // Example market close:
-  const side = directionFromAlert === 'buy' ? 'sell' : 'buy'; // opposing
-  // Calculate volume from balance...
-  // ...
+  await exchange.createOrder(SYMBOL, 'market', side, closeSize, null, { reduceOnly: true });
+
   return true;
 }
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT} | Mode: ${IS_DEMO ? 'DEMO' : 'LIVE'}`));
