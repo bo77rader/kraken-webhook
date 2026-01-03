@@ -13,7 +13,8 @@ const IS_DEMO = true;
 const API_KEY = '7l/19mgahFtopiis6jcf4Mr/TjBAVWM4hTng+Vjv62wb8Yrjy6TiDJ7v';
 const API_SECRET = 'yCJ1NuOhKO0eocIyBo8yAp2VV+EdbmTpjuQ4gBcLkbMBXeVY5l3IXyQUScnq02rZcBF+PWGkQt7yAqs4EXPIoFzW';
 
-const SYMBOL = 'PF_SOLUSD';
+// Correct unified CCXT symbol for Kraken Futures SOL perpetual
+const SYMBOL = 'SOL/USD:USD';
 
 const MAX_LEVERAGE = 10;
 
@@ -52,96 +53,88 @@ app.post('/webhook', async (req, res) => {
 
     const side = params.b === 'buy' ? 'buy' : 'sell';
     const orderType = params.t === 'limit' ? 'limit' : 'market';
-    let qtyPct = parseFloat(params.q) / 100 || 0.1; // default to 10% if missing
+
+    // Clean q value (remove % if present from PineScript)
+    let qStr = (params.q || '10').replace('%', '').trim();
+    let qtyPct = parseFloat(qStr) / 100 || 0.1;
 
     console.log('Fetching balance...');
     const balance = await exchange.fetchBalance();
-    console.log('Raw balance response:', JSON.stringify(balance));
+    console.log('Raw balance:', JSON.stringify(balance));
 
-    const marginBalanceUSD = balance['USD']?.free || balance['PUSD']?.free || balance.info?.availableBalance || 0;
+    // Kraken Futures uses 'USD' or similar for multi-collateral
+    const marginBalanceUSD = balance.free['USD'] || balance.free['USDT'] || balance['USD']?.free || balance['USDT']?.free || 0;
     console.log('Available margin USD:', marginBalanceUSD);
 
     if (marginBalanceUSD <= 0) throw new Error('No available margin balance');
 
     console.log('Fetching ticker...');
     const ticker = await exchange.fetchTicker(SYMBOL);
-    console.log('Raw ticker response:', JSON.stringify(ticker));
+    console.log('Raw ticker:', JSON.stringify(ticker));
 
-    const currentPrice = ticker.last || ticker.bid || ticker.ask || ticker.markPrice || 0;
+    const currentPrice = ticker.last || ticker.markPrice || ticker.bid || ticker.ask || 0;
     console.log('Current price:', currentPrice);
 
     if (currentPrice <= 0) throw new Error('Invalid price from ticker');
 
     console.log('Fetching positions...');
     const positions = await exchange.fetchPositions([SYMBOL]);
-    console.log('Raw positions response:', JSON.stringify(positions));
+    console.log('Raw positions:', JSON.stringify(positions));
 
     const solPos = positions.find(p => p.symbol === SYMBOL) || { contracts: 0 };
     const currentSize = Math.abs(solPos.contracts || 0);
     const currentNotional = currentSize * currentPrice;
-    console.log('Current position size (contracts):', currentSize);
-    console.log('Current notional:', currentNotional);
 
     qtyPct = Math.min(qtyPct, MAX_LEVERAGE);
-    console.log('Effective qtyPct (leverage):', qtyPct);
 
     let proposedAdditionalNotional = qtyPct * marginBalanceUSD;
-    console.log('Proposed additional notional:', proposedAdditionalNotional);
 
     const maxNotional = MAX_LEVERAGE * marginBalanceUSD;
     const maxAdditionalNotional = maxNotional - currentNotional;
-    console.log('Max additional notional (leverage cap):', maxAdditionalNotional);
 
     if (maxAdditionalNotional <= 0) throw new Error('Leverage cap exceeded');
 
     proposedAdditionalNotional = Math.min(proposedAdditionalNotional, maxAdditionalNotional);
 
     let contracts = Math.floor(proposedAdditionalNotional / currentPrice);
-    console.log('Calculated contracts:', contracts);
 
-    // Force minimum 1 contract to avoid "too small" and for testing
-    if (contracts < 1) {
-      console.log('Contracts too small - forcing to 1 for testing');
+    // Safety: force at least 1 contract
+    if (isNaN(contracts) || contracts < 1) {
+      console.log('Contracts invalid or too small - forcing to 1');
       contracts = 1;
     }
+
+    console.log('Final contracts to trade:', contracts);
 
     const orderParams = { reduceOnly: false };
     if (orderType === 'limit' && params.p) {
       orderParams.price = parseFloat(params.p);
     }
 
-    console.log('Placing order:', side, orderType, contracts, 'contracts');
-    const order = await exchange.createOrder(SYMBOL, orderType, side, contracts.toString(), null, orderParams);
+    console.log('Placing order...');
+    const order = await exchange.createOrder(SYMBOL, orderType, side, contracts, null, orderParams);
     console.log('Order result:', JSON.stringify(order));
 
     res.send(`Order placed: ${side} ${contracts} contracts @ ${orderType === 'limit' ? params.p : 'market'}`);
   } catch (err) {
-    console.error('Full error:', err);
-    console.error('Error stack:', err.stack);
+    console.error('Error:', err.message || JSON.stringify(err));
     res.status(500).send('Error: ' + (err.message || JSON.stringify(err)));
   }
 });
 
 async function closePosition(side) {
   try {
-    console.log('Fetching positions for close...');
     const positions = await exchange.fetchPositions([SYMBOL]);
-    console.log('Raw positions for close:', JSON.stringify(positions));
-
     const solPos = positions.find(p => p.symbol === SYMBOL);
-    if (!solPos || Math.abs(solPos.contracts || 0) === 0) {
-      console.log('No position to close');
-      return false;
-    }
 
-    const closeSize = Math.abs(solPos.contracts).toString();
-    console.log('Closing position with size:', closeSize);
+    if (!solPos || Math.abs(solPos.contracts || 0) === 0) return false;
+
+    const closeSize = Math.abs(solPos.contracts);
 
     await exchange.createOrder(SYMBOL, 'market', side, closeSize, null, { reduceOnly: true });
-    console.log('Close order sent');
     return true;
   } catch (err) {
-    console.error('Close error:', err);
+    console.error('Close error:', err.message);
     return false;
   }
 }
